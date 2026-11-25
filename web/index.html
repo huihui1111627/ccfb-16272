@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>慢节点识别与处理 · 64 卡训练监控</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #181f2e; --panel2: #1f293d; --line: #2a3650;
+    --text: #dce4f2; --muted: #8595b0; --accent: #4f9dff; --good: #37c98c;
+    --warn: #f0b429; --bad: #f25f5c; --purple: #a78bfa;
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text);
+         font:13px/1.5 -apple-system,"PingFang SC","Microsoft YaHei",monospace; }
+  header { padding:14px 20px; border-bottom:1px solid var(--line);
+           display:flex; align-items:center; gap:18px; flex-wrap:wrap; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  .controls { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  select, button { background:var(--panel2); color:var(--text); border:1px solid var(--line);
+           border-radius:6px; padding:5px 10px; font-size:12px; cursor:pointer; }
+  button:hover, select:hover { border-color:var(--accent); }
+  .layout { display:grid; grid-template-columns: 1fr 360px; gap:14px; padding:14px 20px; }
+  .col { display:flex; flex-direction:column; gap:14px; min-width:0; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+          padding:14px; }
+  .card h2 { font-size:13px; margin:0 0 10px; color:var(--muted); font-weight:600;
+             text-transform:uppercase; letter-spacing:.06em; }
+  .kpis { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; }
+  .kpi { background:var(--panel2); border-radius:8px; padding:10px; }
+  .kpi .v { font-size:20px; font-weight:700; }
+  .kpi .l { color:var(--muted); font-size:11px; margin-top:2px; }
+  .good { color:var(--good);} .bad{color:var(--bad);} .warn{color:var(--warn);}
+  .accent{color:var(--accent);} .purple{color:var(--purple);}
+  canvas { display:block; width:100%; image-rendering:pixelated; cursor:crosshair; }
+  .heat-wrap { overflow-x:auto; }
+  .legend { display:flex; gap:14px; align-items:center; margin-top:8px;
+            color:var(--muted); font-size:11px; flex-wrap:wrap; }
+  .swatch { display:inline-block; width:12px; height:12px; border-radius:3px;
+            vertical-align:-2px; margin-right:4px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th,td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  th { color:var(--muted); font-weight:600; position:sticky; top:0;
+       background:var(--panel); }
+  .table-scroll { max-height:340px; overflow-y:auto; }
+  .tag { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px;
+         white-space:nowrap; }
+  .t-eject{background:rgba(242,95,92,.18); color:var(--bad);}
+  .t-rebalance{background:rgba(79,157,255,.18); color:var(--accent);}
+  .t-rejoin{background:rgba(55,201,140,.18); color:var(--good);}
+  .t-rollback{background:rgba(240,180,41,.18); color:var(--warn);}
+  .t-watch{background:rgba(167,139,250,.18); color:var(--purple);}
+  .log { font-size:11px; max-height:300px; overflow-y:auto; }
+  .log .row { padding:5px 0; border-bottom:1px solid var(--line); }
+  .log .st { color:var(--muted); margin-right:6px; }
+  .chart-wrap { position:relative; height:180px; }
+  #tooltip { position:fixed; pointer-events:none; background:#0b0f18; border:1px solid var(--line);
+             border-radius:8px; padding:8px 10px; font-size:11px; display:none; z-index:50;
+             max-width:280px; box-shadow:0 6px 24px rgba(0,0,0,.5); }
+  .pill { font-size:11px; padding:2px 8px; border-radius:10px; background:var(--panel2);
+          color:var(--muted); }
+  .hostband { stroke:var(--line); stroke-width:1; }
+  .stepmarker { stroke:var(--accent); stroke-dasharray:3 3; }
+  .row2 { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  .muted{color:var(--muted);}
+  .evidence { color:var(--muted); font-size:11px; margin-top:3px; }
+  .gpuitem { padding:8px; border:1px solid var(--line); border-radius:8px; margin-bottom:8px;
+             background:var(--panel2); }
+  .gpuitem .top { display:flex; justify-content:space-between; gap:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>慢节点识别与处理仿真 · 64 卡 / 8 机器</h1>
+  <div class="controls">
+    <label class="muted">运行组
+      <select id="runSelect">
+        <option value="full">full（检测+处理）</option>
+        <option value="observe">observe（只检测）</option>
+        <option value="clean">clean（无慢因）</option>
+      </select>
+    </label>
+    <label class="muted">热力分量
+      <select id="metricSelect">
+        <option value="total">总耗时</option>
+        <option value="compute">计算</option>
+        <option value="comm">通信</option>
+        <option value="data">数据加载</option>
+      </select>
+    </label>
+    <button id="playBtn">▶ 播放时间轴</button>
+    <span class="pill" id="stepPill">step 0</span>
+  </div>
+</header>
+
+<div class="layout">
+  <div class="col">
+    <div class="card">
+      <h2>关键指标（full vs observe vs clean）</h2>
+      <div class="kpis" id="kpis"></div>
+    </div>
+
+    <div class="card">
+      <h2>每卡每步耗时热力图（行=GPU，按机器分组；列=训练步）</h2>
+      <div class="heat-wrap"><canvas id="heat" height="560"></canvas></div>
+      <div class="legend">
+        <span>耗时</span>
+        <span><i class="swatch" style="background:#16233c"></i>低</span>
+        <span><i class="swatch" style="background:#2f6fb0"></i></span>
+        <span><i class="swatch" style="background:#f0b429"></i></span>
+        <span><i class="swatch" style="background:#f25f5c"></i>高</span>
+        <span style="margin-left:20px"><i class="swatch" style="background:#000;border:1px solid #555"></i>已剔除</span>
+        <span><i class="swatch" style="background:#a78bfa"></i>观察中</span>
+      </div>
+    </div>
+
+    <div class="row2">
+      <div class="card"><h2>步墙钟时间 (ms)</h2><div class="chart-wrap"><canvas id="wallChart"></canvas></div></div>
+      <div class="card"><h2>等待占比（归一化）</h2><div class="chart-wrap"><canvas id="waitChart"></canvas></div></div>
+    </div>
+    <div class="card"><h2>训练损失曲线（验证剔除前后衔接）</h2><div class="chart-wrap"><canvas id="lossChart"></canvas></div></div>
+  </div>
+
+  <div class="col">
+    <div class="card">
+      <h2>当前被判为慢的卡</h2>
+      <div id="slowPanel"><div class="muted">加载中…</div></div>
+    </div>
+    <div class="card">
+      <h2>处理记录</h2>
+      <div class="table-scroll">
+        <table id="actionTable">
+          <thead><tr><th>步</th><th>动作</th><th>卡</th><th>原因/置信度</th><th>状态</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <h2>事件剧本（ground truth）</h2>
+      <div class="log" id="eventLog"></div>
+    </div>
+  </div>
+</div>
+
+<div id="tooltip"></div>
+<script src="/web/app.js"></script>
+</body>
+</html>
